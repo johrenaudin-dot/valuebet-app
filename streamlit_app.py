@@ -6,15 +6,15 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# -----------------------------
-# CONFIG
-# -----------------------------
+# ===========================
+# CONFIG GÉNÉRALE
+# ===========================
 st.set_page_config(page_title="ValueBet - Picks du jour (Consensus Marché)",
                    page_icon=":soccer:", layout="wide")
 TZ = ZoneInfo("Europe/Paris")
-TIMEOUT = 12
+TIMEOUT = 12  # secondes pour les requêtes HTTP
 
-# The Odds API sport keys (corrigées)
+# The Odds API sports keys (correctes)
 SPORT_KEYS = {
     "Premier League": "soccer_epl",
     "La Liga": "soccer_spain_la_liga",
@@ -25,13 +25,13 @@ SPORT_KEYS = {
     "UEL": "soccer_uefa_europa_league",
 }
 
-# -----------------------------
-# FONCTIONS
-# -----------------------------
+# ===========================
+# UTILITAIRES
+# ===========================
 def expected_value(p, o):
     if not (np.isfinite(p) and np.isfinite(o)):
         return np.nan
-    return float(p * o - 1.0)
+    return float(p*o - 1.0)
 
 def kelly_fraction(p, o, cap=0.05):
     if not (np.isfinite(p) and np.isfinite(o) and 0 <= p <= 1 and o > 1):
@@ -89,7 +89,6 @@ def best_prices_and_fair_by_book(event):
     away = event.get("away_team")
     best = {"H": None, "D": None, "A": None}
     fair_list = []
-
     for bk in event.get("bookmakers", []):
         for m in bk.get("markets", []):
             if m.get("key") != "h2h":
@@ -123,27 +122,24 @@ def edge_color(edge: float) -> str:
     if edge >= 0.03: return "#ffb300"   # borderline
     return "#9e9e9e"
 
-# -----------------------------
-# SIDEBAR
-# -----------------------------
+# ===========================
+# SIDEBAR (paramètres)
+# ===========================
 st.sidebar.header("Paramètres")
+
 bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=1000.0, step=100.0, format="%.0f")
 min_edge = st.sidebar.slider("Edge minimum (p×odds - 1)", 0.0, 0.20, 0.03, 0.01)
 kelly_cap = st.sidebar.slider("Kelly Cap (mise max %)", 0.0, 0.20, 0.05, 0.01)
 
-# freins conservateurs
-min_prob = st.sidebar.slider("Proba minimum du pick (modèle)", 0.00, 0.30, 0.10, 0.01)
-min_books = st.sidebar.slider("Nb minimum de bookmakers", 1, 10, 4)
+# Hygiène de données
+min_prob = st.sidebar.slider("Proba minimum du pick (modèle)", 0.00, 0.30, 0.08, 0.01)
+min_books = st.sidebar.slider("Nb minimum de bookmakers", 1, 10, 3)
 blend_w = st.sidebar.slider("Poids consensus vs marché (shrinkage)", 0.0, 1.0, 0.60, 0.05)
-max_std = st.sidebar.slider("Dispersion max des probas (écart-type)", 0.00, 0.20, 0.06, 0.01)
+max_std = st.sidebar.slider("Dispersion max des probas (écart-type)", 0.00, 0.20, 0.07, 0.01)
 
-# garde-fous "value" explicites
-enforce_model_ge_consensus = st.sidebar.checkbox("Exiger p_mod ≥ p_cons (issue retenue)", value=True)
-enforce_consensus_edge = st.sidebar.checkbox("Exiger edge (consensus) ≥ edge min", value=True)
-
-# limite de cote optionnelle
+# Limite de cote optionnelle (désactivée par défaut)
 limit_odds = st.sidebar.checkbox("Limiter la cote max ?", value=False)
-max_odds = st.sidebar.number_input("Cote max (si coché)", min_value=1.01, value=12.0, step=0.5, disabled=not limit_odds)
+max_odds = st.sidebar.number_input("Cote max (si coché)", min_value=1.01, value=20.0, step=0.5, disabled=not limit_odds)
 
 debug_mode = st.sidebar.checkbox("Mode debug (diagnostics)", value=True)
 
@@ -160,17 +156,18 @@ leagues_selected = st.sidebar.multiselect(
     default=["Premier League","La Liga","Serie A","Bundesliga","Ligue 1","UCL","UEL"]
 )
 
-# -----------------------------
-# MAIN
-# -----------------------------
+# ===========================
+# EN-TÊTE
+# ===========================
 st.title("ValueBet - Picks du jour (Consensus Marché)")
 st.caption(
     "Proba consensus = médiane des probas 'fair' (1/cote, normalisées). "
-    "Proba **modèle** = mélange consensus↔marché (shrinkage) pour réduire les extrêmes. "
+    "Proba modèle = mélange consensus↔marché (shrinkage) pour réduire les extrêmes. "
     "Edge modèle = p_mod × meilleure cote − 1.  "
-    "Les garde-fous garantissent un value vs consensus (p_mod ≥ p_cons et/ou edge_cons ≥ edge min)."
+    "Garde-fous **toujours appliqués** : p_mod ≥ p_cons, edge_consensus > 0, edge_modèle ≥ edge_min."
 )
 
+# Clé API
 api_key = st.secrets.get("ODDS_API_KEY")
 if not api_key:
     st.error("❌ Aucune clé The Odds API trouvée (Settings → Secrets → `ODDS_API_KEY`).")
@@ -181,6 +178,9 @@ end_iso   = f"{end_day.strftime('%Y-%m-%d')}T23:59:59Z"
 
 rows, diag_rows, debug_rows = [], [], []
 
+# ===========================
+# BOUCLE PRINCIPALE
+# ===========================
 for lname in leagues_selected:
     skey = SPORT_KEYS[lname]
     data, err = fetch_odds(skey, start_iso, end_iso, api_key)
@@ -218,7 +218,7 @@ for lname in leagues_selected:
                                "Motif": f"Rejet: dispersion>{max_std} (std={std_max:.3f})"})
             continue
 
-        # Probas implicites du marché (meilleures cotes)
+        # Probas implicites du marché (à partir des meilleures cotes)
         inv = np.array([1/float(best["H"]), 1/float(best["D"]), 1/float(best["A"])], float)
         inv = inv / inv.sum()
         market_probs = {"H": float(inv[0]), "D": float(inv[1]), "A": float(inv[2])}
@@ -241,11 +241,12 @@ for lname in leagues_selected:
             pick_map.items(), key=lambda kv: (kv[1][2] if np.isfinite(kv[1][2]) else -9e9)
         )
 
-        # Gardes-fous "value vs consensus"
+        # Garde-fous "laser focus"
         p_cons_pick = consensus[best_label]
         edge_cons_pick = p_cons_pick * o_star - 1.0
 
-        if enforce_model_ge_consensus and p_star < p_cons_pick:
+        # 1) le modèle ne doit jamais être sous le consensus
+        if p_star < p_cons_pick:
             debug_rows.append({
                 "Date (UTC)": ev.get("commence_time",""),
                 "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
@@ -253,29 +254,39 @@ for lname in leagues_selected:
             })
             continue
 
-        if enforce_consensus_edge and edge_cons_pick < min_edge:
+        # 2) edge consensus strictement positif
+        if edge_cons_pick <= 0.0:
             debug_rows.append({
                 "Date (UTC)": ev.get("commence_time",""),
                 "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: edge_cons({edge_cons_pick:.3f}) < min_edge({min_edge:.3f})"
+                "Motif": f"Rejet: edge_cons({edge_cons_pick:.3f}) ≤ 0"
             })
             continue
 
-        # Limite de cote optionnelle
-        if limit_odds and o_star > max_odds:
+        # 3) edge modèle au-dessus du seuil
+        if edge_star < min_edge:
             debug_rows.append({
                 "Date (UTC)": ev.get("commence_time",""),
                 "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: cote>{max_odds} (o={o_star:.2f})"
+                "Motif": f"Rejet: edge_model({edge_star:.3f}) < min_edge({min_edge:.3f})"
             })
             continue
 
-        # proba min du pick (modèle)
+        # Proba min du pick
         if p_star < min_prob:
             debug_rows.append({
                 "Date (UTC)": ev.get("commence_time",""),
                 "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
                 "Motif": f"Rejet: proba<{min_prob} (p={p_star:.3f})"
+            })
+            continue
+
+        # Limite de cote (si activée)
+        if limit_odds and o_star > max_odds:
+            debug_rows.append({
+                "Date (UTC)": ev.get("commence_time",""),
+                "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
+                "Motif": f"Rejet: cote>{max_odds} (o={o_star:.2f})"
             })
             continue
 
@@ -293,13 +304,13 @@ for lname in leagues_selected:
             "Home": ev.get("home_team"), "Away": ev.get("away_team"),
             "Pick": best_label,
             "Cote": round(o_star, 2),
-            # proba du pick selon modèle et selon consensus
+            # probas modèle
             "ProbaModele": round(p_star, 3),
-            "ProbaConsensusPick": round(p_cons_pick, 3),
-            # les 3 probas modèle H/D/A
             "P_H": round(probs_final["H"], 3),
             "P_D": round(probs_final["D"], 3),
             "P_A": round(probs_final["A"], 3),
+            # consensus sur l'issue
+            "ProbaConsensusPick": round(p_cons_pick, 3),
             # edges
             "Edge": round(edge_star, 3),
             "EdgeConsensus": round(edge_cons_pick, 3),
@@ -310,10 +321,11 @@ for lname in leagues_selected:
 
     diag_rows.append({"Ligue": lname, "Matchs fenêtre": match_count, "Avec cotes": with_prices, "Erreur API": ""})
 
-# -----------------------------
+# ===========================
 # AFFICHAGE
-# -----------------------------
+# ===========================
 st.subheader("🎯 Picks à jouer (clairs et colorés)")
+
 if not rows:
     st.info("Aucun value bet trouvé pour la fenêtre et les paramètres actuels.")
 else:
@@ -384,6 +396,6 @@ st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
 if debug_mode:
     st.subheader("Debug — motifs de rejet / détails")
     if debug_rows:
-        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, height=500)
+        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, height=520)
     else:
         st.write("Aucun match rejeté (ou pas de cotes disponibles).")
