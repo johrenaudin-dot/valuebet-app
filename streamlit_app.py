@@ -132,22 +132,29 @@ def adjust_with_h2h(S, home, away):
     factor_away = 1.0 + ((ratio_away - 0.5)*0.1)
     return factor_home, factor_away
 
-# Sidebar
+# ================= UI =================
 st.sidebar.header("Parametres")
 bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=1000.0, step=100.0, format="%.0f")
 min_edge = st.sidebar.slider("Edge minimum", 0.0, 0.15, 0.03, 0.01)
 kelly_cap = st.sidebar.slider("Kelly Cap (mise max %)", 0.0, 0.2, 0.05, 0.01)
-leagues_selected = st.sidebar.multiselect("Ligues", list(LEAGUE_CODES.keys()),
-                                          default=["Premier League","La Liga","Serie A","Bundesliga","Ligue 1","UCL","UEL"])
+debug_mode = st.sidebar.checkbox("Mode debug (afficher tous les matchs)")
+
+leagues_selected = st.sidebar.multiselect(
+    "Ligues",
+    list(LEAGUE_CODES.keys()),
+    default=["Premier League","La Liga","Serie A","Bundesliga","Ligue 1","UCL","UEL"]
+)
 today = datetime.now(TZ).date()
-st.sidebar.write(f"Aujourd'hui : **{today.isoformat()}**")
+st.sidebar.write(f"Aujourd'hui : {today.isoformat()}")
 
 @st.cache_data(show_spinner=False)
 def load_league(code: str):
     url = season_path(SEASON_START, code)
     return fetch_csv(url)
 
-rows = []
+rows = []          # picks (value bets)
+debug_rows = []    # tous les matchs du jour (meme sans value)
+
 for lname in leagues_selected:
     code = LEAGUE_CODES[lname]
     df = load_league(code)
@@ -156,30 +163,70 @@ for lname in leagues_selected:
     df["Date"] = coerce_date_col(df["Date"])
     df = df[df["Date"].notna()]
     S = team_strengths_poisson(df, today)
-    if S is None: 
+    if S is None:
         continue
     todays = df[df["Date"]==today].copy()
-    if todays.empty: 
+    if todays.empty:
         continue
     for _, r in todays.iterrows():
-        oh, od, oa = pick_odds_row(r)
-        if oh is None: 
-            continue
         home, away = r["HomeTeam"], r["AwayTeam"]
+        oh, od, oa = pick_odds_row(r)
+
+        # Construire ligne debug "avant filtre"
+        base_debug = {
+            "Date": today.isoformat(),
+            "Ligue": lname,
+            "Home": home,
+            "Away": away,
+            "Odds_H": oh, "Odds_D": od, "Odds_A": oa
+        }
+
+        if oh is None or od is None or oa is None:
+            dline = base_debug.copy()
+            dline.update({
+                "Proba_H": np.nan, "Proba_D": np.nan, "Proba_A": np.nan,
+                "Edge_H": np.nan, "Edge_D": np.nan, "Edge_A": np.nan,
+                "BestPick": None, "BestEdge": np.nan, "Motif": "Cotes manquantes"
+            })
+            debug_rows.append(dline)
+            continue
+
         lam_h = (S["base_h"] if S["base_h"]>0 else 1)*float(S["ha"].get(home,1.0))*float(S["ad"].get(away,1.0))
         lam_a = (S["base_a"] if S["base_a"]>0 else 1)*float(S["aa"].get(away,1.0))*float(S["hd"].get(home,1.0))
+
         f_home, f_away_dom = adjust_with_home_away(S, home, away)
         f_home_h2h, f_away_h2h = adjust_with_h2h(S, home, away)
         lam_h *= f_home * f_home_h2h
         lam_a *= f_away_dom * f_away_h2h
+
         ph, pd_, pa = poisson_probs(lam_h, lam_a, MAX_GOALS)
         edge_h = expected_value(ph, oh)
         edge_d = expected_value(pd_, od)
         edge_a = expected_value(pa, oa)
-        pick_map = {"H": (ph, oh, edge_h), "D": (pd_, od, edge_d), "A": (pa, oa, edge_a)}
-        best_label, (p_star, o_star, edge_star) = max(pick_map.items(), key=lambda kv: (kv[1][2] if kv[1][2] is not None else -9e9))
-        if o_star is None or edge_star is None or edge_star < min_edge:
+
+        # ligne debug
+        best_label = None
+        best_edge = None
+        try:
+            pick_map = {"H": (ph, oh, edge_h), "D": (pd_, od, edge_d), "A": (pa, oa, edge_a)}
+            best_label, (_, _, best_edge) = max(pick_map.items(), key=lambda kv: (kv[1][2] if kv[1][2] is not None else -9e9))
+        except Exception:
+            pass
+
+        dline = base_debug.copy()
+        dline.update({
+            "Proba_H": round(ph,3), "Proba_D": round(pd_,3), "Proba_A": round(pa,3),
+            "Edge_H": round(edge_h,3), "Edge_D": round(edge_d,3), "Edge_A": round(edge_a,3),
+            "BestPick": best_label, "BestEdge": round(best_edge,3) if best_edge is not None else np.nan,
+            "Motif": "" if (best_edge is not None and best_edge >= min_edge) else "Edge < seuil"
+        })
+        debug_rows.append(dline)
+
+        # picks (appliquer filtre)
+        if best_edge is None or best_edge < min_edge:
             continue
+        p_star = {"H": ph, "D": pd_, "A": pa}[best_label]
+        o_star = {"H": oh, "D": od, "A": oa}[best_label]
         kelly = kelly_fraction(p_star, o_star, cap=kelly_cap)
         stake = bankroll*kelly
         rows.append({
@@ -190,17 +237,31 @@ for lname in leagues_selected:
             "Pick": best_label,
             "Cote": round(o_star,2),
             "ProbaModele": round(p_star,3),
-            "Edge": round(edge_star,3),
+            "Edge": round(best_edge,3),
             "MiseEUR": round(stake,2),
             "KellyPct": round(100*kelly,2),
         })
 
 st.title("ValueBet - Picks du jour")
-st.caption("Poisson ajuste (domicile/exterieur, H2H) - affiche seulement les value bets au-dessus de ton seuil.")
+st.caption("Poisson ajuste (domicile/exterieur, H2H) - Montre uniquement les value bets au-dessus du seuil. Active 'Mode debug' pour tout voir.")
 
+# Tableau principal (picks)
 if not rows:
     st.info("Aucun value bet trouve aujourd'hui avec les parametres actuels.")
 else:
     dfp = pd.DataFrame(rows).sort_values(["Edge","MiseEUR"], ascending=[False,False]).reset_index(drop=True)
     st.metric("Value bets trouves", len(dfp))
     st.dataframe(dfp, use_container_width=True, height=min(600,100+35*len(dfp)))
+
+# Tableau debug
+if debug_mode:
+    st.subheader("Debug - Tous les matchs du jour")
+    if debug_rows:
+        dfd = pd.DataFrame(debug_rows)
+        # Colonnes ordonnees pour la lisibilite
+        cols = ["Date","Ligue","Home","Away","Odds_H","Odds_D","Odds_A",
+                "Proba_H","Proba_D","Proba_A","Edge_H","Edge_D","Edge_A","BestPick","BestEdge","Motif"]
+        dfd = dfd.reindex(columns=[c for c in cols if c in dfd.columns])
+        st.dataframe(dfd, use_container_width=True, height=min(700,120+30*len(dfd)))
+    else:
+        st.write("Aucun match recense pour aujourd'hui dans les ligues selectionnees.")
