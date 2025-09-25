@@ -1,21 +1,51 @@
+# streamlit_app.py
 # -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
-# ===========================
-# CONFIG GÉNÉRALE
-# ===========================
-st.set_page_config(page_title="ValueBet - Picks du jour (Consensus Marché)",
-                   page_icon=":soccer:", layout="wide")
-TZ = ZoneInfo("Europe/Paris")
-TIMEOUT = 12  # secondes pour les requêtes HTTP
+st.set_page_config(page_title="ValueBet - API Odds", page_icon="⚽", layout="wide")
 
-# The Odds API sports keys (correctes)
-SPORT_KEYS = {
+# ==============================
+# Paramètres utilisateur
+# ==============================
+st.sidebar.header("Paramètres")
+
+bankroll = st.sidebar.number_input("Bankroll (€)", 0, 1_000_000, 1000)
+edge_min = st.sidebar.slider("Edge minimum", 0.0, 0.20, 0.03, 0.01)
+kelly_cap = st.sidebar.slider("Kelly Cap (mise max %)", 0.0, 0.20, 0.05, 0.01)
+min_prob = st.sidebar.slider("Proba minimum du pick (modèle)", 0.0, 0.30, 0.08, 0.01)
+min_books = st.sidebar.slider("Nb minimum de bookmakers", 1, 10, 3)
+
+days_ahead = st.sidebar.slider("Fenêtre (jours à venir)", 0, 7, 3)
+
+# ==============================
+# Fonctions utilitaires
+# ==============================
+def expected_value(p, o): 
+    return p*o - 1
+
+def kelly_fraction(p, o, cap=0.05):
+    b = o - 1
+    if b <= 0: return 0
+    f = (p*b - (1-p)) / b
+    return max(0, min(cap, f))
+
+def edge_color(edge):
+    if edge >= 0.10: return "#1b5e20"
+    if edge >= 0.07: return "#2e7d32"
+    if edge >= 0.05: return "#ff9800"
+    return "#9e9e9e"
+
+# ==============================
+# API Odds
+# ==============================
+API_KEY = st.secrets["ODDS_API_KEY"]
+BASE_URL = "https://api.the-odds-api.com/v4/sports"
+
+sports = {
     "Premier League": "soccer_epl",
     "La Liga": "soccer_spain_la_liga",
     "Serie A": "soccer_italy_serie_a",
@@ -25,377 +55,109 @@ SPORT_KEYS = {
     "UEL": "soccer_uefa_europa_league",
 }
 
-# ===========================
-# UTILITAIRES
-# ===========================
-def expected_value(p, o):
-    if not (np.isfinite(p) and np.isfinite(o)):
-        return np.nan
-    return float(p*o - 1.0)
+# ==============================
+# Récupération des cotes
+# ==============================
+st.title("🎯 ValueBet - Picks du jour (Consensus Marché)")
 
-def kelly_fraction(p, o, cap=0.05):
-    if not (np.isfinite(p) and np.isfinite(o) and 0 <= p <= 1 and o > 1):
-        return 0.0
-    b = o - 1.0
-    f = (p*b - (1-p)) / b
-    return float(max(0.0, min(cap, f)))
+date_from = datetime.now(timezone.utc)
+date_to = date_from + timedelta(days=days_ahead)
 
-def fair_probs_from_prices(oh, od, oa):
-    try:
-        inv = np.array([1/oh, 1/od, 1/oa], dtype=float)
-        s = inv.sum()
-        if s <= 0:
-            return None
-        fair = inv / s
-        return {"H": float(fair[0]), "D": float(fair[1]), "A": float(fair[2])}
-    except Exception:
-        return None
+all_matches = []
 
-def aggregate_consensus(fair_list):
-    H, D, A = [], [], []
-    for p in fair_list:
-        if not p:
-            continue
-        H.append(p["H"]); D.append(p["D"]); A.append(p["A"])
-    if not H or not D or not A:
-        return None
-    h, d, a = float(np.median(H)), float(np.median(D)), float(np.median(A))
-    s = h + d + a
-    if s <= 0:
-        return None
-    return {"H": h/s, "D": d/s, "A": a/s}
-
-def fetch_odds(sport_key: str, start_iso: str, end_iso: str, api_key: str):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+for lig, sport_key in sports.items():
+    url = f"{BASE_URL}/{sport_key}/odds"
     params = {
-        "apiKey": api_key,
+        "apiKey": API_KEY,
         "regions": "eu",
         "markets": "h2h",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
-        "commenceTimeFrom": start_iso,
-        "commenceTimeTo": end_iso,
+        "commenceTimeFrom": date_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "commenceTimeTo": date_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    try:
-        r = requests.get(url, params=params, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return None, f"{r.status_code} - {r.text}"
-        return r.json(), None
-    except Exception as e:
-        return None, str(e)
-
-def best_prices_and_fair_by_book(event):
-    home = event.get("home_team")
-    away = event.get("away_team")
-    best = {"H": None, "D": None, "A": None}
-    fair_list = []
-    for bk in event.get("bookmakers", []):
-        for m in bk.get("markets", []):
-            if m.get("key") != "h2h":
-                continue
-            oh = od = oa = None
-            for o in m.get("outcomes", []):
-                name = (o.get("name") or "").strip()
-                price = o.get("price")
-                if price is None:
-                    continue
-                if name == home:
-                    oh = float(price)
-                elif name == away:
-                    oa = float(price)
-                elif name.lower() == "draw":
-                    od = float(price)
-            if oh and od and oa:
-                if best["H"] is None or oh > best["H"]:
-                    best["H"] = oh
-                if best["D"] is None or od > best["D"]:
-                    best["D"] = od
-                if best["A"] is None or oa > best["A"]:
-                    best["A"] = oa
-                fair_list.append(fair_probs_from_prices(oh, od, oa))
-    return best, fair_list
-
-def edge_color(edge: float) -> str:
-    if edge >= 0.10: return "#1b5e20"   # très fort
-    if edge >= 0.07: return "#2e7d32"
-    if edge >= 0.05: return "#43a047"
-    if edge >= 0.03: return "#ffb300"   # borderline
-    return "#9e9e9e"
-
-# ===========================
-# SIDEBAR (paramètres)
-# ===========================
-st.sidebar.header("Paramètres")
-
-bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=1000.0, step=100.0, format="%.0f")
-min_edge = st.sidebar.slider("Edge minimum (p×odds - 1)", 0.0, 0.20, 0.03, 0.01)
-kelly_cap = st.sidebar.slider("Kelly Cap (mise max %)", 0.0, 0.20, 0.05, 0.01)
-
-# Hygiène de données
-min_prob = st.sidebar.slider("Proba minimum du pick (modèle)", 0.00, 0.30, 0.08, 0.01)
-min_books = st.sidebar.slider("Nb minimum de bookmakers", 1, 10, 3)
-blend_w = st.sidebar.slider("Poids consensus vs marché (shrinkage)", 0.0, 1.0, 0.60, 0.05)
-max_std = st.sidebar.slider("Dispersion max des probas (écart-type)", 0.00, 0.20, 0.07, 0.01)
-
-# Limite de cote optionnelle (désactivée par défaut)
-limit_odds = st.sidebar.checkbox("Limiter la cote max ?", value=False)
-max_odds = st.sidebar.number_input("Cote max (si coché)", min_value=1.01, value=20.0, step=0.5, disabled=not limit_odds)
-
-debug_mode = st.sidebar.checkbox("Mode debug (diagnostics)", value=True)
-
-base_day = st.sidebar.date_input("Date de référence", datetime.now(TZ).date())
-days_ahead = st.sidebar.slider("Jours à venir (0-7)", 0, 7, 2)
-start_day, end_day = base_day, base_day + timedelta(days=days_ahead)
-st.sidebar.write(f"Fenêtre: {start_day.isoformat()} → {end_day.isoformat()}")
-
-if st.sidebar.button("Recharger (vider le cache)"):
-    st.cache_data.clear()
-
-leagues_selected = st.sidebar.multiselect(
-    "Ligues analysées", list(SPORT_KEYS.keys()),
-    default=["Premier League","La Liga","Serie A","Bundesliga","Ligue 1","UCL","UEL"]
-)
-
-# ===========================
-# EN-TÊTE
-# ===========================
-st.title("ValueBet - Picks du jour (Consensus Marché)")
-st.caption(
-    "Proba consensus = médiane des probas 'fair' (1/cote, normalisées). "
-    "Proba modèle = mélange consensus↔marché (shrinkage) pour réduire les extrêmes. "
-    "Edge modèle = p_mod × meilleure cote − 1.  "
-    "Garde-fous **toujours appliqués** : p_mod ≥ p_cons, edge_consensus > 0, edge_modèle ≥ edge_min."
-)
-
-# Clé API
-api_key = st.secrets.get("ODDS_API_KEY")
-if not api_key:
-    st.error("❌ Aucune clé The Odds API trouvée (Settings → Secrets → `ODDS_API_KEY`).")
-    st.stop()
-
-start_iso = f"{start_day.strftime('%Y-%m-%d')}T00:00:00Z"
-end_iso   = f"{end_day.strftime('%Y-%m-%d')}T23:59:59Z"
-
-rows, diag_rows, debug_rows = [], [], []
-
-# ===========================
-# BOUCLE PRINCIPALE
-# ===========================
-for lname in leagues_selected:
-    skey = SPORT_KEYS[lname]
-    data, err = fetch_odds(skey, start_iso, end_iso, api_key)
-    if data is None:
-        diag_rows.append({"Ligue": lname, "Matchs fenêtre": 0, "Avec cotes": 0, "Erreur API": err})
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        st.warning(f"{lig}: Erreur API {r.status_code} - {r.text}")
         continue
+    data = r.json()
 
-    match_count = len(data)
-    with_prices = 0
-
-    for ev in data:
-        best, fair_list = best_prices_and_fair_by_book(ev)
-        book_count = len([p for p in fair_list if p])
-        if book_count < min_books:
-            debug_rows.append({"Date (UTC)": ev.get("commence_time",""), "Ligue": lname,
-                               "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                               "Motif": f"Rejet: bookmakers<{min_books}"})
+    for match in data:
+        date = match["commence_time"]
+        home, away = match["home_team"], match["away_team"]
+        odds_all = []
+        for book in match.get("bookmakers", []):
+            for mk in book["markets"]:
+                if mk["key"] == "h2h":
+                    prices = mk["outcomes"]
+                    if len(prices) == 2:  # pas de draw
+                        continue
+                    odds = {o["name"]: o["price"] for o in prices}
+                    odds_all.append(odds)
+        if len(odds_all) < min_books:
             continue
 
-        consensus = aggregate_consensus(fair_list)
-        if consensus is None or None in (best["H"], best["D"], best["A"]):
-            debug_rows.append({"Date (UTC)": ev.get("commence_time",""), "Ligue": lname,
-                               "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                               "Motif": "Cotes insuffisantes"})
+        # meilleures cotes
+        bestH = max([o.get(home, np.nan) for o in odds_all], default=np.nan)
+        bestD = max([o.get("Draw", np.nan) for o in odds_all], default=np.nan)
+        bestA = max([o.get(away, np.nan) for o in odds_all], default=np.nan)
+        if np.isnan([bestH, bestD, bestA]).any(): 
             continue
 
-        # Dispersion (écart-type des probas par book)
-        arrH = [p["H"] for p in fair_list if p]
-        arrD = [p["D"] for p in fair_list if p]
-        arrA = [p["A"] for p in fair_list if p]
-        std_max = float(max(np.std(arrH), np.std(arrD), np.std(arrA)))
-        if std_max > max_std:
-            debug_rows.append({"Date (UTC)": ev.get("commence_time",""), "Ligue": lname,
-                               "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                               "Motif": f"Rejet: dispersion>{max_std} (std={std_max:.3f})"})
-            continue
+        # probas "fair"
+        probs = []
+        for o in odds_all:
+            if home in o and "Draw" in o and away in o:
+                inv = [1/o[home], 1/o["Draw"], 1/o[away]]
+                s = sum(inv)
+                probs.append([x/s for x in inv])
+        if not probs: continue
+        probs = np.array(probs)
 
-        # Probas implicites du marché (à partir des meilleures cotes)
-        inv = np.array([1/float(best["H"]), 1/float(best["D"]), 1/float(best["A"])], float)
-        inv = inv / inv.sum()
-        market_probs = {"H": float(inv[0]), "D": float(inv[1]), "A": float(inv[2])}
+        p_cons = np.median(probs, axis=0)  # consensus
+        p_mod = p_cons  # simplifié: modèle = consensus
 
-        # Shrinkage : proba modèle
-        probs_final = {k: blend_w*consensus[k] + (1.0-blend_w)*market_probs[k] for k in ("H","D","A")}
+        picks = {"H": (home, bestH, p_cons[0], p_mod[0]),
+                 "D": ("Draw", bestD, p_cons[1], p_mod[1]),
+                 "A": (away, bestA, p_cons[2], p_mod[2])}
 
-        with_prices += 1
+        for res, (team, odds, p_c, p_m) in picks.items():
+            if odds <= 1: continue
+            edge_c = expected_value(p_c, odds)
+            edge_m = expected_value(p_m, odds)
+            if edge_c > 0 and edge_m >= edge_min and p_m >= p_c and p_m >= min_prob:
+                kelly = kelly_fraction(p_m, odds, cap=kelly_cap)
+                stake = kelly*bankroll
+                all_matches.append({
+                    "Date": date,
+                    "Ligue": lig,
+                    "Match": f"{home} vs {away}",
+                    "Pick": team,
+                    "Odds": odds,
+                    "p_cons": round(p_c,3),
+                    "p_mod": round(p_m,3),
+                    "Edge": round(edge_m,3),
+                    "Kelly%": round(kelly*100,2),
+                    "Stake€": round(stake,2)
+                })
 
-        # Edge modèle pour chaque issue
-        eH = expected_value(probs_final["H"], best["H"])
-        eD = expected_value(probs_final["D"], best["D"])
-        eA = expected_value(probs_final["A"], best["A"])
-        pick_map = {
-            "H": (probs_final["H"], best["H"], eH),
-            "D": (probs_final["D"], best["D"], eD),
-            "A": (probs_final["A"], best["A"], eA),
-        }
-        best_label, (p_star, o_star, edge_star) = max(
-            pick_map.items(), key=lambda kv: (kv[1][2] if np.isfinite(kv[1][2]) else -9e9)
-        )
-
-        # Garde-fous "laser focus"
-        p_cons_pick = consensus[best_label]
-        edge_cons_pick = p_cons_pick * o_star - 1.0
-
-        # 1) le modèle ne doit jamais être sous le consensus
-        if p_star < p_cons_pick:
-            debug_rows.append({
-                "Date (UTC)": ev.get("commence_time",""),
-                "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: p_mod({p_star:.3f}) < p_cons({p_cons_pick:.3f})"
-            })
-            continue
-
-        # 2) edge consensus strictement positif
-        if edge_cons_pick <= 0.0:
-            debug_rows.append({
-                "Date (UTC)": ev.get("commence_time",""),
-                "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: edge_cons({edge_cons_pick:.3f}) ≤ 0"
-            })
-            continue
-
-        # 3) edge modèle au-dessus du seuil
-        if edge_star < min_edge:
-            debug_rows.append({
-                "Date (UTC)": ev.get("commence_time",""),
-                "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: edge_model({edge_star:.3f}) < min_edge({min_edge:.3f})"
-            })
-            continue
-
-        # Proba min du pick
-        if p_star < min_prob:
-            debug_rows.append({
-                "Date (UTC)": ev.get("commence_time",""),
-                "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: proba<{min_prob} (p={p_star:.3f})"
-            })
-            continue
-
-        # Limite de cote (si activée)
-        if limit_odds and o_star > max_odds:
-            debug_rows.append({
-                "Date (UTC)": ev.get("commence_time",""),
-                "Ligue": lname, "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-                "Motif": f"Rejet: cote>{max_odds} (o={o_star:.2f})"
-            })
-            continue
-
-        # Heure locale pour affichage
-        try:
-            date_local = pd.to_datetime(ev.get("commence_time")).tz_convert("Europe/Paris").strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            date_local = (ev.get("commence_time") or "")[:16]
-
-        kelly = kelly_fraction(p_star, o_star, cap=kelly_cap)
-        stake = bankroll * kelly
-
-        rows.append({
-            "DateLocal": date_local, "Ligue": lname,
-            "Home": ev.get("home_team"), "Away": ev.get("away_team"),
-            "Pick": best_label,
-            "Cote": round(o_star, 2),
-            # probas modèle
-            "ProbaModele": round(p_star, 3),
-            "P_H": round(probs_final["H"], 3),
-            "P_D": round(probs_final["D"], 3),
-            "P_A": round(probs_final["A"], 3),
-            # consensus sur l'issue
-            "ProbaConsensusPick": round(p_cons_pick, 3),
-            # edges
-            "Edge": round(edge_star, 3),
-            "EdgeConsensus": round(edge_cons_pick, 3),
-            # staking
-            "MiseEUR": round(stake, 2),
-            "KellyPct": round(100*kelly, 2),
-        })
-
-    diag_rows.append({"Ligue": lname, "Matchs fenêtre": match_count, "Avec cotes": with_prices, "Erreur API": ""})
-
-# ===========================
-# AFFICHAGE
-# ===========================
-st.subheader("🎯 Picks à jouer (clairs et colorés)")
-
-if not rows:
-    st.info("Aucun value bet trouvé pour la fenêtre et les paramètres actuels.")
+# ==============================
+# Résultats
+# ==============================
+if not all_matches:
+    st.info("Aucun value bet trouvé avec ces paramètres.")
 else:
-    dfp = pd.DataFrame(rows).sort_values(["Edge","MiseEUR"], ascending=[False, False]).reset_index(drop=True)
-
-    # CARTES (TOP 10)
-    for _, r in dfp.head(10).iterrows():
-        col = edge_color(r["Edge"])
-        pick_txt = {"H": "Victoire HOME", "D": "Match NUL", "A": "Victoire AWAY"}[r["Pick"]]
-        chips_hda = (
-            f"<span style='background:#263238;padding:4px 8px;border-radius:8px;'>H {int(round(r['P_H']*100))}%</span>"
-            f"<span style='background:#263238;padding:4px 8px;border-radius:8px;'>D {int(round(r['P_D']*100))}%</span>"
-            f"<span style='background:#263238;padding:4px 8px;border-radius:8px;'>A {int(round(r['P_A']*100))}%</span>"
-        )
+    df = pd.DataFrame(all_matches)
+    st.metric("🎲 Nombre de picks trouvés", len(df))
+    for _, r in df.iterrows():
         st.markdown(
             f"""
-<div style="border-radius:12px;padding:14px 16px;margin:10px 0;
-            background:#111;border-left:10px solid {col};color:#fff;">
-  <div style="display:flex;justify-content:space-between;align-items:center;">
-    <div style="font-size:18px;font-weight:600;">
-      {r['DateLocal']} · <span style="opacity:.85">{r['Ligue']}</span>
-    </div>
-    <div style="font-size:14px;opacity:.8;">Edge <b>{int(round(r['Edge']*100))}%</b></div>
-  </div>
-  <div style="margin-top:6px;font-size:17px;">
-    <b>{r['Home']} vs {r['Away']}</b>
-  </div>
-  <div style="margin-top:6px;display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
-    <span style="background:{col};color:#fff;padding:4px 10px;border-radius:8px;">
-      Pick : <b>{pick_txt}</b>
-    </span>
-    <span style="background:#263238;padding:4px 10px;border-radius:8px;">
-      Cote : <b>{r['Cote']}</b>
-    </span>
-    <span style="background:#263238;padding:4px 10px;border-radius:8px;">
-      Proba modèle : <b>{int(round(r['ProbaModele']*100))}%</b>
-    </span>
-    <span style="background:#263238;padding:4px 10px;border-radius:8px;">
-      Proba consensus : <b>{int(round(r['ProbaConsensusPick']*100))}%</b>
-    </span>
-    <span style="background:#263238;padding:4px 10px;border-radius:8px;">
-      Edge (consensus) : <b>{int(round(r['EdgeConsensus']*100))}%</b>
-    </span>
-    <span style="background:#263238;padding:4px 10px;border-radius:8px;">
-      Mise : <b>{r['MiseEUR']}€</b> (Kelly {r['KellyPct']}%)
-    </span>
-  </div>
-  <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
-    {chips_hda}
-  </div>
-</div>
-""",
-            unsafe_allow_html=True
+            <div style="background:{edge_color(r['Edge'])};padding:10px;border-radius:10px;margin:5px">
+            <b>{r['Date']} · {r['Ligue']}</b><br>
+            {r['Match']}<br>
+            ✅ Pick: <b>{r['Pick']}</b><br>
+            Cote: {r['Odds']} | p_cons: {r['p_cons']} | p_mod: {r['p_mod']} | Edge: {r['Edge']}<br>
+            Mise: {r['Stake€']}€ (Kelly {r['Kelly%']}%)
+            </div>
+            """, unsafe_allow_html=True
         )
-
-    st.subheader("🧾 Tableau récapitulatif")
-    cols = ["DateLocal","Ligue","Home","Away","Pick","Cote",
-            "ProbaModele","ProbaConsensusPick","P_H","P_D","P_A",
-            "Edge","EdgeConsensus","MiseEUR","KellyPct"]
-    dfp = dfp.reindex(columns=cols)
-    st.metric("Value bets trouvés", len(dfp))
-    st.dataframe(dfp, use_container_width=True, height=min(600, 100 + 35*len(dfp)))
-
-# DIAGNOSTIC & DEBUG
-st.subheader("Diagnostic par ligue")
-st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
-
-if debug_mode:
-    st.subheader("Debug — motifs de rejet / détails")
-    if debug_rows:
-        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, height=520)
-    else:
-        st.write("Aucun match rejeté (ou pas de cotes disponibles).")
