@@ -3,268 +3,172 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, date, timedelta
+import math
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-import os
 
+# -----------------------------
+# CONFIG
+# -----------------------------
 st.set_page_config(page_title="ValueBet - Today's Picks", page_icon=":soccer:", layout="wide")
+TZ = ZoneInfo("Europe/Paris")
+MAX_GOALS = 10
 
-SEASON_START = 2025
-LEAGUE_CODES = {
-    "Premier League": "E0",
-    "La Liga": "SP1",
-    "Serie A": "I1",
-    "Bundesliga": "D1",
-    "Ligue 1": "F1",
-    "UCL": "EC",
-    "UEL": "EL",
-}
 SPORT_KEYS = {
     "Premier League": "soccer_epl",
     "La Liga": "soccer_spain_la_liga",
     "Serie A": "soccer_italy_serie_a",
     "Bundesliga": "soccer_germany_bundesliga",
-    "Ligue 1": "soccer_france_ligue_1",
+    "Ligue 1": "soccer_france_ligue_one",
     "UCL": "soccer_uefa_champions_league",
     "UEL": "soccer_uefa_europa_league",
 }
-MAX_GOALS = 10
-TZ = ZoneInfo("Europe/Paris")
 
-def yy(y: int) -> str:
-    return f"{y%100:02d}"
-
-def season_path(season_start: int, code: str) -> str:
-    return f"https://www.football-data.co.uk/mmz4281/{yy(season_start)}{yy(season_start+1)}/{code}.csv"
-
-def fetch_csv(url: str) -> pd.DataFrame | None:
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            return None
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        return df
-    except Exception:
-        return None
-
-def coerce_date_col(s: pd.Series) -> pd.Series:
-    def parse_one(x):
-        for fmt in ("%d/%m/%Y","%d/%m/%y","%Y-%m-%d"):
-            try:
-                return datetime.strptime(str(x), fmt).date()
-            except Exception:
-                continue
-        return pd.NaT
-    return s.apply(parse_one)
-
-def pick_odds_row(row):
-    cols_ps = ["PSH","PSD","PSA"]
-    cols_b = ["B365H","B365D","B365A"]
-    if all(c in row.index for c in cols_ps) and not pd.isna(row["PSH"]):
-        return row["PSH"], row["PSD"], row["PSA"]
-    if all(c in row.index for c in cols_b) and not pd.isna(row["B365H"]):
-        return row["B365H"], row["B365D"], row["B365A"]
-    return None, None, None
-
-def implied_probs_from_odds(oh, od, oa):
-    if None in (oh, od, oa):
-        return np.nan, np.nan, np.nan
-    o = np.array([oh, od, oa], dtype=float)
-    imp = 1.0 / o
-    s = imp.sum()
-    return (imp / s).tolist()
+# -----------------------------
+# FONCTIONS
+# -----------------------------
 
 def poisson_probs(lam_h, lam_a, max_goals=10):
-    gh = np.arange(0, max_goals+1)
-    ga = np.arange(0, max_goals+1)
-    ph = np.exp(-lam_h) * np.power(lam_h, gh) / np.array([np.math.factorial(i) for i in gh])
-    pa = np.exp(-lam_a) * np.power(lam_a, ga) / np.array([np.math.factorial(i) for i in ga])
+    gh = np.arange(0, max_goals + 1)
+    ga = np.arange(0, max_goals + 1)
+    denom_h = np.array([math.factorial(int(i)) for i in gh], dtype=float)
+    denom_a = np.array([math.factorial(int(i)) for i in ga], dtype=float)
+    ph = np.exp(-lam_h) * np.power(lam_h, gh) / denom_h
+    pa = np.exp(-lam_a) * np.power(lam_a, ga) / denom_a
     mat = np.outer(ph, pa)
-    p_draw = np.trace(mat)
-    p_home = np.tril(mat, -1).sum()
-    p_away = np.triu(mat, 1).sum()
-    return float(p_home), float(p_draw), float(p_away)
+    p_draw = float(np.trace(mat))
+    p_home = float(np.tril(mat, -1).sum())
+    p_away = float(np.triu(mat, 1).sum())
+    return p_home, p_draw, p_away
 
 def kelly_fraction(p, o, cap=0.05):
-    if not (np.isfinite(p) and np.isfinite(o) and o>1):
+    if not (np.isfinite(p) and np.isfinite(o) and o > 1):
         return 0.0
     b = o - 1.0
-    f = (p*b - (1-p)) / b
+    f = (p * b - (1 - p)) / b
     return float(max(0.0, min(cap, f)))
 
 def expected_value(p, o):
     if not (np.isfinite(p) and np.isfinite(o)):
         return np.nan
-    return float(p*o - 1.0)
+    return float(p * o - 1.0)
 
-def team_strengths_poisson(df: pd.DataFrame, today: date):
-    df = df.copy()
-    if "Date" not in df.columns:
-        return None
-    df["Date"] = coerce_date_col(df["Date"])
-    hist = df[df["Date"] < today]
-    if hist.empty:
-        return None
-    needed = ["HomeTeam","AwayTeam","FTHG","FTAG"]
-    if not all(c in hist.columns for c in needed):
-        return None
-    base_h = hist["FTHG"].mean()
-    base_a = hist["FTAG"].mean()
-    ha = hist.groupby("HomeTeam")["FTHG"].mean() / (base_h if base_h>0 else 1)
-    hd = hist.groupby("HomeTeam")["FTAG"].mean() / (base_a if base_a>0 else 1)
-    aa = hist.groupby("AwayTeam")["FTAG"].mean() / (base_a if base_a>0 else 1)
-    ad = hist.groupby("AwayTeam")["FTHG"].mean() / (base_h if base_h>0 else 1)
-    return dict(base_h=base_h, base_a=base_a, ha=ha, hd=hd, aa=aa, ad=ad, hist=hist)
-
-def adjust_with_home_away(S, home, away):
-    hist = S["hist"]
-    lg_home_win = (hist["FTR"]=="H").mean()
-    lg_away_win = (hist["FTR"]=="A").mean()
-    team_home_win = hist[hist["HomeTeam"]==home]["FTR"].eq("H").mean()
-    team_away_win = hist[hist["AwayTeam"]==away]["FTR"].eq("A").mean()
-    factor_home = 1.0 + ((team_home_win - lg_home_win) * 0.5)
-    factor_away = 1.0 + ((team_away_win - lg_away_win) * 0.5)
-    return factor_home, factor_away
-
-def adjust_with_h2h(S, home, away):
-    hist = S["hist"]
-    h2h = hist[((hist["HomeTeam"]==home)&(hist["AwayTeam"]==away))|((hist["HomeTeam"]==away)&(hist["AwayTeam"]==home))]
-    h2h = h2h.sort_values("Date", ascending=False).head(5)
-    if h2h.empty:
-        return 1.0, 1.0
-    wins_home = ((h2h["HomeTeam"]==home)&(h2h["FTR"]=="H")).sum() + ((h2h["AwayTeam"]==home)&(h2h["FTR"]=="A")).sum()
-    wins_away = ((h2h["HomeTeam"]==away)&(h2h["FTR"]=="H")).sum() + ((h2h["AwayTeam"]==away)&(h2h["FTR"]=="A")).sum()
-    total = len(h2h)
-    ratio_home = wins_home/total
-    ratio_away = wins_away/total
-    factor_home = 1.0 + ((ratio_home - 0.5)*0.1)
-    factor_away = 1.0 + ((ratio_away - 0.5)*0.1)
-    return factor_home, factor_away
-
-# Sidebar
-st.sidebar.header("Parametres")
-bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=1000.0, step=100.0, format="%.0f")
-min_edge = st.sidebar.slider("Edge minimum", 0.0, 0.15, 0.03, 0.01)
-kelly_cap = st.sidebar.slider("Kelly Cap (mise max %)", 0.0, 0.2, 0.05, 0.01)
-debug_mode = st.sidebar.checkbox("Mode debug (afficher tout)")
-ref_date = st.sidebar.date_input("Date de reference", datetime.now(TZ).date())
-days_ahead = st.sidebar.slider("Jours a venir (0-7)", 0, 7, 2)
-start_day = ref_date
-end_day = ref_date + timedelta(days=days_ahead)
-st.sidebar.write(f"Fenetre: {start_day} → {end_day}")
-reload = st.sidebar.button("Recharger les donnees (vider le cache)")
-leagues_selected = st.sidebar.multiselect("Ligues", list(LEAGUE_CODES.keys()),
-                                          default=["Premier League","La Liga","Serie A","Bundesliga","Ligue 1","UCL","UEL"])
-
-# API key
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", st.secrets.get("ODDS_API_KEY", ""))
-
-@st.cache_data(show_spinner=False)
-def load_league(code: str):
-    url = season_path(SEASON_START, code)
-    return fetch_csv(url)
-
-def fetch_odds(league: str):
-    sport_key = SPORT_KEYS.get(league)
-    if not sport_key:
-        return None, f"Unknown sport key for {league}"
+def fetch_odds(sport_key, date_from, date_to):
+    """Appel à The Odds API"""
     url = "https://api.the-odds-api.com/v4/sports/{}/odds".format(sport_key)
     params = {
-        "apiKey": ODDS_API_KEY,
+        "apiKey": st.secrets["ODDS_API_KEY"],
         "regions": "eu",
         "markets": "h2h",
         "oddsFormat": "decimal",
-        # Corrigé: format UTC avec suffixe Z
-        "commenceTimeFrom": f"{start_day.strftime('%Y-%m-%d')}T00:00:00Z",
-        "commenceTimeTo": f"{end_day.strftime('%Y-%m-%d')}T23:59:59Z"
+        "commenceTimeFrom": f"{date_from}T00:00:00Z",
+        "commenceTimeTo": f"{date_to}T23:59:59Z",
     }
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
             return None, f"{r.status_code} - {r.text}"
         return r.json(), None
     except Exception as e:
         return None, str(e)
 
-rows = []
-diag = []
+# -----------------------------
+# SIDEBAR
+# -----------------------------
+st.sidebar.header("Parametres")
+bankroll = st.sidebar.number_input("Bankroll (€)", min_value=0.0, value=1000.0, step=100.0, format="%.0f")
+min_edge = st.sidebar.slider("Edge minimum", 0.0, 0.15, 0.03, 0.01)
+kelly_cap = st.sidebar.slider("Kelly Cap (mise max %)", 0.0, 0.2, 0.05, 0.01)
+debug_mode = st.sidebar.checkbox("Mode debug (afficher tout)", value=False)
+ref_date = st.sidebar.text_input("Date de reference", datetime.now(TZ).date().isoformat())
+days_ahead = st.sidebar.slider("Jours à venir (0-7)", 0, 7, 2)
 
-for lname in leagues_selected:
-    code = LEAGUE_CODES[lname]
-    df = load_league(code)
-    if df is None or "Date" not in df.columns:
-        diag.append(dict(Ligue=lname, Saison=f"{SEASON_START}-{SEASON_START+1}", CSV=False, Matches=0, Avec_cotes=0, Erreur="CSV non charge"))
-        continue
-    df["Date"] = coerce_date_col(df["Date"])
-    df = df[df["Date"].notna()]
-    S = team_strengths_poisson(df, ref_date)
-    odds_data, err_api = fetch_odds(lname)
-    if odds_data is None:
-        diag.append(dict(Ligue=lname, Saison=f"{SEASON_START}-{SEASON_START+1}", CSV=True, Matches=0, Avec_cotes=0, ErreurAPI=err_api))
-        continue
-    diag.append(dict(Ligue=lname, Saison=f"{SEASON_START}-{SEASON_START+1}", CSV=True, Matches=len(odds_data), Avec_cotes=len(odds_data), ErreurAPI=err_api))
-    for match in odds_data:
-        if "bookmakers" not in match or not match["bookmakers"]:
-            continue
-        home, away = match["home_team"], match["away_team"]
-        try:
-            markets = match["bookmakers"][0]["markets"][0]["outcomes"]
-            oh = next((o["price"] for o in markets if o["name"]==home), None)
-            oa = next((o["price"] for o in markets if o["name"]==away), None)
-            od = next((o["price"] for o in markets if o["name"].lower() in ["draw","x"]), None)
-        except Exception:
-            continue
-        if oh is None or oa is None or od is None:
-            continue
-        if S is None: 
-            continue
-        lam_h = (S["base_h"] if S["base_h"]>0 else 1)*float(S["ha"].get(home,1.0))*float(S["ad"].get(away,1.0))
-        lam_a = (S["base_a"] if S["base_a"]>0 else 1)*float(S["aa"].get(away,1.0))*float(S["hd"].get(home,1.0))
-        f_home, f_away_dom = adjust_with_home_away(S, home, away)
-        f_home_h2h, f_away_h2h = adjust_with_h2h(S, home, away)
-        lam_h *= f_home * f_home_h2h
-        lam_a *= f_away_dom * f_away_h2h
-        ph, pd_, pa = poisson_probs(lam_h, lam_a, MAX_GOALS)
-        edge_h = expected_value(ph, oh)
-        edge_d = expected_value(pd_, od)
-        edge_a = expected_value(pa, oa)
-        pick_map = {"H": (ph, oh, edge_h), "D": (pd_, od, edge_d), "A": (pa, oa, edge_a)}
-        best_label, (p_star, o_star, edge_star) = max(pick_map.items(), key=lambda kv: (kv[1][2] if kv[1][2] is not None else -9e9))
-        if not debug_mode and (o_star is None or edge_star is None or edge_star < min_edge):
-            continue
-        kelly = kelly_fraction(p_star, o_star, cap=kelly_cap)
-        stake = bankroll*kelly
-        rows.append({
-            "Date": match.get("commence_time",""),
-            "Ligue": lname,
-            "Home": home,
-            "Away": away,
-            "Pick": best_label,
-            "Cote": round(o_star,2),
-            "ProbaModele": round(p_star,3),
-            "Edge": round(edge_star,3),
-            "MiseEUR": round(stake,2),
-            "KellyPct": round(100*kelly,2),
-        })
+date0 = datetime.fromisoformat(ref_date).date()
+date1 = date0 + timedelta(days=days_ahead)
+st.sidebar.write(f"Fenetre: {date0} → {date1}")
 
+# -----------------------------
+# MAIN
+# -----------------------------
 st.title("ValueBet - Picks du jour (Consensus Marche)")
 st.caption("Méthode : probas 'fair' par bookmaker (1/cote, normalisées), agrégées par médiane → consensus. On compare le consensus à la meilleure cote du marché (edge = p*odds - 1).")
 
+rows = []
+diag = []
+
+for lname, skey in SPORT_KEYS.items():
+    data, err = fetch_odds(skey, date0, date1)
+    if data is None:
+        diag.append({"Ligue": lname, "Matchs fenetre": 0, "Avec cotes": 0, "Erreur API": err})
+        continue
+
+    match_count = len(data)
+    bets_ok = 0
+
+    for match in data:
+        if "bookmakers" not in match or not match["bookmakers"]:
+            continue
+
+        outcomes = []
+        for bm in match["bookmakers"]:
+            for mkt in bm.get("markets", []):
+                if mkt["key"] == "h2h":
+                    prices = {o["name"]: o["price"] for o in mkt["outcomes"]}
+                    if len(prices) == 3:  # home/draw/away
+                        total = sum(1/x for x in prices.values())
+                        probs = {k: (1/v)/total for k, v in prices.items()}
+                        outcomes.append({"probs": probs, "prices": prices})
+
+        if not outcomes:
+            continue
+
+        probs_med = {}
+        for side in ["Home", "Draw", "Away"]:
+            vals = [o["probs"].get(side, np.nan) for o in outcomes]
+            probs_med[side] = np.nanmedian(vals)
+
+        best_odds = {}
+        for side in ["Home", "Draw", "Away"]:
+            vals = [o["prices"].get(side, np.nan) for o in outcomes]
+            best_odds[side] = np.nanmax(vals)
+
+        pick_map = {
+            "H": (probs_med["Home"], best_odds["Home"]),
+            "D": (probs_med["Draw"], best_odds["Draw"]),
+            "A": (probs_med["Away"], best_odds["Away"]),
+        }
+        scored = {k: (p, o, expected_value(p, o)) for k, (p, o) in pick_map.items() if o is not None}
+        best_label, (p_star, o_star, edge_star) = max(scored.items(), key=lambda kv: kv[1][2])
+
+        if edge_star >= min_edge:
+            kelly = kelly_fraction(p_star, o_star, cap=kelly_cap)
+            stake = bankroll * kelly
+            rows.append({
+                "Date": match["commence_time"][:10],
+                "Ligue": lname,
+                "Home": match["home_team"],
+                "Away": match["away_team"],
+                "Pick": best_label,
+                "Cote": round(o_star, 2),
+                "ProbaConsensus": round(p_star, 3),
+                "Edge": round(edge_star, 3),
+                "MiseEUR": round(stake, 2),
+                "KellyPct": round(100 * kelly, 2),
+            })
+            bets_ok += 1
+
+    diag.append({"Ligue": lname, "Matchs fenetre": match_count, "Avec cotes": bets_ok, "Erreur API": err})
+
+# -----------------------------
+# DISPLAY
+# -----------------------------
 if not rows:
     st.info("Aucun value bet trouve pour la fenetre et les parametres actuels.")
 else:
-    dfp = pd.DataFrame(rows).sort_values(["Edge","MiseEUR"], ascending=[False,False]).reset_index(drop=True)
+    dfp = pd.DataFrame(rows).sort_values(["Edge", "MiseEUR"], ascending=[False, False]).reset_index(drop=True)
     st.metric("Value bets trouves", len(dfp))
-    st.dataframe(dfp, use_container_width=True, height=min(600,100+35*len(dfp)))
-
-st.subheader("Diagnostic par ligue")
-dfdiag = pd.DataFrame(diag)
-st.dataframe(dfdiag)
+    st.dataframe(dfp, use_container_width=True, height=min(600, 100 + 35 * len(dfp)))
 
 if debug_mode:
-    st.subheader("Debug - Tous les matchs dans la fenetre")
-    if rows:
-        st.dataframe(pd.DataFrame(rows))
-    else:
-        st.write("Aucun match recense (ou pas de cotes disponibles).")
+    st.subheader("Diagnostic par ligue")
+    st.dataframe(pd.DataFrame(diag))
